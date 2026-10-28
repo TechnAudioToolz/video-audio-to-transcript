@@ -43,9 +43,11 @@ looking at language patterns.
 - [ ] Settings: choose the default formats there too; Check for updates (like Audiobook Maker)
 - [ ] VoiceOver pass
 
-## Publish
-- [ ] README screenshots (public-domain or self-made videos only)
-- [ ] Create the GitHub repo and the first release (ask first)
+## Published 2026-10-28: public repo + v0.1.0 release (offline DMG)
+- [x] github.com/TechnAudioToolz/video-audio-to-transcript, README with four examples and screenshots
+- [ ] Test the DMG on another Mac
+- Next release: bump CFBundleShortVersionString in app/Resources/Info.plist, ./build.sh && ./make_offline_dmg.sh,
+  then `gh release create`
 
 ## Later
 - [ ] Other languages (Parakeet ultra knows 25 European languages)
