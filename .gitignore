@@ -23,3 +23,7 @@ app/.swiftpm/
 # app assets are images too, but belong in the repo
 !app/Resources/*.png
 !docs/screenshots/*.png
+
+# the example transcript of the public town hall meeting
+!examples/*.pdf
+!examples/*.docx

@@ -37,6 +37,8 @@ final class Item: ObservableObject, Identifiable {
     @Published var error = ""
     /// Exact number of people talking; 0 lets the app work it out.
     @Published var speakers = 0
+    /// Clean up the sound before listening.
+    @Published var cleanup = Cleanup.off
     @Published var transcript: Transcript?
     /// The files written for this item (PDF, DOCX…).
     @Published var outputs: [URL] = []
@@ -65,8 +67,28 @@ final class Item: ObservableObject, Identifiable {
         let at = CMTime(seconds: min(30, (duration ?? 10) / 10), preferredTimescale: 600)
         if let (image, _) = try? await generator.image(at: at) {
             thumbnail = NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
+        } else if let frame = await ffmpegFrame(url, at: at.seconds) {  // AV1, VP9, MKV… the Mac can't decode
+            thumbnail = frame
         }
     }
+}
+
+/// One frame of a video as a small picture, through ffmpeg.
+@MainActor
+func ffmpegFrame(_ url: URL, at seconds: Double) async -> NSImage? {
+    guard let ffmpeg = AudioExtractor.ffmpegPath else { return nil }
+    let file = FileManager.default.temporaryDirectory.appendingPathComponent("thumb-\(UUID().uuidString).jpg")
+    defer { try? FileManager.default.removeItem(at: file) }
+    let data = await Task.detached { () -> Data? in
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: ffmpeg)
+        process.arguments = ["-nostdin", "-loglevel", "error", "-ss", String(seconds), "-i", url.path,
+                             "-frames:v", "1", "-vf", "scale=320:-2", "-y", file.path]
+        guard (try? process.run()) != nil else { return nil }
+        process.waitUntilExit()
+        return try? Data(contentsOf: file)
+    }.value
+    return data.flatMap(NSImage.init(data:))
 }
 
 /// Length in seconds of a file the Mac can't open itself (MKV, WebM…), from ffprobe next to ffmpeg.
@@ -90,9 +112,17 @@ final class AppModel: ObservableObject {
     static let videoTypes = ["mp4", "mov", "m4v", "mkv", "webm", "avi", "wmv", "flv", "mpg", "mpeg", "ts", "mts", "3gp"]
     static let audioTypes = ["mp3", "m4a", "m4b", "wav", "aiff", "aif", "caf", "flac", "ogg", "opus", "aac", "wma"]
 
+    /// `--demo FOLDER` (for README pictures and tests) keeps everything in FOLDER: the list, the transcripts
+    /// and the saved files, so the usual list and output folder are left alone.
+    nonisolated static let demoFolder: URL? = {
+        let args = CommandLine.arguments
+        return args.firstIndex(of: "--demo").flatMap { args.indices.contains($0 + 1) ? URL(fileURLWithPath: args[$0 + 1]) : nil }
+    }()
+
     nonisolated static var supportFolder: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Transcript Maker")
+        demoFolder?.appendingPathComponent("support")
+            ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("Transcript Maker")
     }
 
     @Published var items: [Item] = []
@@ -118,6 +148,10 @@ final class AppModel: ObservableObject {
     @Published var timestamps = UserDefaults.standard.object(forKey: "timestamps") as? Bool ?? true {
         didSet { UserDefaults.standard.set(timestamps, forKey: "timestamps") }
     }
+    /// Sound clean-up for files added from now on (each file can be changed in its panel).
+    @Published var defaultCleanup = Cleanup(rawValue: UserDefaults.standard.string(forKey: "cleanup") ?? "") ?? .off {
+        didSet { UserDefaults.standard.set(defaultCleanup.rawValue, forKey: "cleanup") }
+    }
     /// Start transcribing as soon as files are added, without pressing Start.
     @Published var startWhenAdded = UserDefaults.standard.object(forKey: "startWhenAdded") as? Bool ?? true {
         didSet { UserDefaults.standard.set(startWhenAdded, forKey: "startWhenAdded") }
@@ -129,7 +163,8 @@ final class AppModel: ObservableObject {
     private var stopRequested = false
 
     var outputFolder: URL {
-        outputPath.isEmpty
+        if let demo = Self.demoFolder { return demo.appendingPathComponent("output") }
+        return outputPath.isEmpty
             ? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Transcripts")
             : URL(fileURLWithPath: outputPath)
     }
@@ -171,6 +206,7 @@ final class AppModel: ObservableObject {
             if Self.videoTypes.contains(ext) { kind = .video } else if Self.audioTypes.contains(ext) { kind = .audio } else { continue }
             if items.contains(where: { $0.url == url && $0.state != .done }) { continue }
             let item = Item(url: url, kind: kind)
+            item.cleanup = defaultCleanup
             items.append(item)
             queueOrder.append(item.id)
             added.append(item)
@@ -265,6 +301,7 @@ final class AppModel: ObservableObject {
         process.executableURL = Self.helper
         var arguments = [item.url.path, "--json", item.transcriptFile.path, "--progress"]
         if item.speakers > 0 { arguments += ["--speakers", String(item.speakers)] }
+        if item.cleanup != .off { arguments += ["--cleanup", item.cleanup.rawValue] }
         process.arguments = arguments
         let pipe = Pipe()
         process.standardOutput = pipe
@@ -295,7 +332,7 @@ final class AppModel: ObservableObject {
 
     /// The stages' share of the total time, measured on a few videos (listening and voices take most of it).
     private static let stageWeights: [String: (start: Double, share: Double)] = [
-        "loading": (0, 0.04), "extracting": (0.04, 0.04), "listening": (0.08, 0.5),
+        "loading": (0, 0.04), "extracting": (0.04, 0.04), "cleaning": (0.08, 0.06), "listening": (0.14, 0.44),
         "speakers": (0.58, 0.4), "writing": (0.98, 0.02),
     ]
 
@@ -313,7 +350,7 @@ final class AppModel: ObservableObject {
     }
 
     private func describe(stage: String, fraction: Double, overall: Double) -> String {
-        let names = ["loading": "Loading the speech models", "extracting": "Taking out the sound",
+        let names = ["loading": "Loading the speech models", "extracting": "Taking out the sound", "cleaning": "Cleaning up the sound",
                      "listening": "Listening for words", "speakers": "Telling the voices apart", "writing": "Writing the transcript"]
         var text = names[stage] ?? stage
         if fraction > 0, fraction < 1 { text += " · \(Int(fraction * 100))%" }
@@ -453,6 +490,7 @@ final class AppModel: ObservableObject {
         var state: ItemState
         var queued: Bool
         var speakers: Int
+        var cleanup: Cleanup?
         var outputs: [String]
         var error: String
     }
@@ -461,7 +499,7 @@ final class AppModel: ObservableObject {
         let saved = items.map { item in
             Saved(id: item.id, path: item.url.path, kind: item.kind, title: item.title,
                   state: item.state == .working ? .waiting : item.state, queued: queueOrder.contains(item.id) || item.state == .working,
-                  speakers: item.speakers, outputs: item.outputs.map(\.path), error: item.error)
+                  speakers: item.speakers, cleanup: item.cleanup, outputs: item.outputs.map(\.path), error: item.error)
         }
         // queue order first, then the rest
         let order = (current.map { [$0.id] } ?? []) + queueOrder
@@ -479,6 +517,7 @@ final class AppModel: ObservableObject {
             item.title = s.title
             item.state = s.state
             item.speakers = s.speakers
+            item.cleanup = s.cleanup ?? .off
             item.outputs = s.outputs.map { URL(fileURLWithPath: $0) }
             item.error = s.error
             if s.state == .done {

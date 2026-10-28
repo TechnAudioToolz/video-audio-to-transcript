@@ -26,11 +26,14 @@ public enum ModelStore {
 public struct PipelineOptions: Sendable {
     /// Exact number of people talking, when known; nil to let the app work it out.
     public var speakers: Int?
+    /// Clean up the sound before listening (off unless chosen).
+    public var cleanup: Cleanup = .off
     /// Words that should be spelled a particular way (names, jargon); used to steer the recogniser.
     public var vocabulary: [String] = []
 
-    public init(speakers: Int? = nil) {
+    public init(speakers: Int? = nil, cleanup: Cleanup = .off) {
         self.speakers = speakers
+        self.cleanup = cleanup
     }
 }
 
@@ -38,6 +41,7 @@ public struct PipelineOptions: Sendable {
 public enum PipelineStage: String, Sendable {
     case loading = "Loading the speech models"
     case extracting = "Taking out the sound"
+    case cleaning = "Cleaning up the sound"
     case listening = "Listening for words"
     case speakers = "Telling the voices apart"
     case writing = "Writing the transcript"
@@ -55,6 +59,12 @@ public actor Pipeline {
     public func prepare(log: @Sendable (String) -> Void = { _ in }) async throws {
         try await prepareSpeech(log: log)
         try await prepareVoices()
+    }
+
+    /// Every model the app can use, including sound clean-up's: for building the offline edition.
+    public func downloadAll(log: @Sendable (String) -> Void = { _ in }) async throws {
+        try await prepare(log: log)
+        _ = try await LocalVqeManager(config: LocalVqeConfig(computeUnits: .cpuAndGPU), directory: ModelStore.folder)
     }
 
     /// The speech recogniser. `encoderUnits` nil means its usual place, the Neural Engine.
@@ -94,17 +104,27 @@ public actor Pipeline {
                     stage: @escaping @Sendable (PipelineStage, Double) -> Void,
                     log: @escaping @Sendable (String) -> Void = { _ in }) async throws -> Transcript {
         stage(.loading, 0)
+        log("Models: \(ModelStore.folder.path)")
         // one model set at a time: loading the voice models while the speech model is still being readied
         // for the Neural Engine has made the speech model fail
         try await prepareSpeech(log: log)
         guard let asr else { throw TranscriptError.modelsMissing("speech model") }
 
         try FileManager.default.createDirectory(at: workFolder, withIntermediateDirectories: true)
-        let wav = workFolder.appendingPathComponent("audio-16k.wav")
+        var wav = workFolder.appendingPathComponent("audio-16k.wav")
         stage(.extracting, 0)
         var started = Date()
         let duration = try await AudioExtractor.extract(input, to: wav) { stage(.extracting, $0) }
         log(String(format: "Sound taken out: %@ long (%.1f s)", clock(duration), Date().timeIntervalSince(started)))
+        let original = wav
+        if options.cleanup != .off {
+            stage(.cleaning, 0)
+            started = Date()
+            let cleaned = workFolder.appendingPathComponent("audio-clean.wav")
+            try await SoundCleaner.clean(original, to: cleaned, level: options.cleanup, models: ModelStore.folder) { stage(.cleaning, $0) }
+            wav = cleaned
+            log(String(format: "Sound cleaned up (%@, %.1f s)", options.cleanup.label.lowercased(), Date().timeIntervalSince(started)))
+        }
 
         stage(.listening, 0)
         started = Date()
@@ -139,7 +159,9 @@ public actor Pipeline {
         } else {
             try await prepareVoices(speakers: options.speakers)
             guard let diarizer else { throw TranscriptError.modelsMissing("voice model") }
-            segments = try await diarizer.process(wav) { done, total in stage(.speakers, Double(done) / Double(max(1, total))) }.segments
+            // TM_VOICES_FROM=original: tell voices apart from the sound before clean-up (for testing)
+            let voices = ProcessInfo.processInfo.environment["TM_VOICES_FROM"] == "original" ? original : wav
+            segments = try await diarizer.process(voices) { done, total in stage(.speakers, Double(done) / Double(max(1, total))) }.segments
             log(String(format: "Found %d voice%@ (%.1f s)", Set(segments.map(\.speakerId)).count,
                        Set(segments.map(\.speakerId)).count == 1 ? "" : "s", Date().timeIntervalSince(started)))
         }
@@ -150,32 +172,45 @@ public actor Pipeline {
         transcript.sourceFile = input.lastPathComponent
         transcript.duration = duration
         transcript.engine = "Parakeet (\(ModelStore.parakeetVersion))"
-        try? FileManager.default.removeItem(at: wav)  // about 2 MB a minute; the transcript keeps the times
+            + (options.cleanup == .off ? "" : ", sound clean-up: \(options.cleanup.label.lowercased())")
+        try? FileManager.default.removeItem(at: workFolder)  // about 2 MB a minute; the transcript keeps the times
         return transcript
     }
 
     /// Joins the recogniser's word pieces ("▁ex", "amp", "le") into whole words with start and end times.
-    /// Word pieces that start a new word begin with a space.
+    /// A piece that starts a new word begins with a space; numbers come as a lone space piece and then the
+    /// digits ("▁about", "▁", "2", "4" is "about 24").
     static func words(from tokens: [TokenTiming]) -> [Word] {
         var words: [Word] = []
         var confidences: [Float] = []
+        var newWord = true
+        func finishWord() {
+            if let last = words.indices.last, !confidences.isEmpty {
+                words[last].confidence = confidences.reduce(0, +) / Float(confidences.count)
+            }
+            confidences = []
+        }
         for token in tokens {
             let piece = token.token.replacingOccurrences(of: "▁", with: " ")
-            let startsWord = piece.hasPrefix(" ") || words.isEmpty
-            let text = piece.trimmingCharacters(in: .whitespaces)
-            if startsWord {
-                if let last = words.indices.last { words[last].confidence = confidences.reduce(0, +) / Float(confidences.count) }
-                guard !text.isEmpty else { continue }
+            // "<unk>" is a sound the model has no spelling for (often a bleep or a word cut short)
+            let text = piece.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "<unk>", with: "*")
+            if piece.hasPrefix(" ") { newWord = true }
+            guard !text.isEmpty else { continue }
+            if newWord || words.isEmpty {
+                finishWord()
                 words.append(Word(text: text, start: token.startTime, end: token.endTime, confidence: token.confidence))
-                confidences = [token.confidence]
-            } else if let last = words.indices.last {
-                words[last].text += text
-                words[last].end = token.endTime
-                confidences.append(token.confidence)
+                newWord = false
+            } else {
+                words[words.count - 1].text += text
+                words[words.count - 1].end = token.endTime
             }
+            confidences.append(token.confidence)
         }
-        if let last = words.indices.last, !confidences.isEmpty {
-            words[last].confidence = confidences.reduce(0, +) / Float(confidences.count)
+        finishWord()
+        // "i" on its own is always "I" in English; the recogniser sometimes writes it small
+        for i in words.indices {
+            let w = words[i].text
+            if w == "i" || w.hasPrefix("i'") { words[i].text = "I" + w.dropFirst() }
         }
         return words
     }
@@ -195,6 +230,7 @@ enum Merger {
             return previous
         }
         smoothBlips(&speakerOfWord, words)
+        snapChanges(&speakerOfWord, words)
 
         var paragraphs: [Paragraph] = []
         for (i, word) in words.enumerated() {
@@ -238,6 +274,34 @@ enum Merger {
                 for k in i...j { speakers[k] = speakers[i - 1] }
             }
             i = j + 1
+        }
+    }
+
+    /// The voice model's changes of speaker can land a word or two early or late ("…as well I | do so…" when
+    /// "I do so" is the next person). People take turns at pauses and sentence ends, so each change moves to
+    /// the best such spot within three words.
+    static func snapChanges(_ speakers: inout [Int], _ words: [Word]) {
+        func score(_ j: Int, from k: Int) -> Double {
+            let gap = max(0, words[j].start - words[j - 1].end)
+            let ending = words[j - 1].text.last
+            let punctuation = ending.map { ".?!".contains($0) } ?? false ? 0.3 : (ending == "," ? 0.1 : 0)
+            return min(gap, 1.5) + punctuation - 0.05 * Double(abs(j - k))
+        }
+        var k = 1
+        while k < speakers.count {
+            guard speakers[k] != speakers[k - 1] else { k += 1; continue }
+            // stay between the neighbouring changes, so no turn disappears
+            var low = k, high = k
+            while low - 1 >= 1, k - (low - 1) <= 3, speakers[low - 2] == speakers[k - 1] { low -= 1 }
+            while high + 1 < speakers.count, high + 1 - k <= 3, speakers[high + 1] == speakers[k] { high += 1 }
+            var best = k
+            for j in low...high where score(j, from: k) > score(best, from: k) + 0.05 { best = j }
+            if best < k {
+                for i in best..<k { speakers[i] = speakers[k] }
+            } else if best > k {
+                for i in k..<best { speakers[i] = speakers[k - 1] }
+            }
+            k = max(k, best) + 1
         }
     }
 

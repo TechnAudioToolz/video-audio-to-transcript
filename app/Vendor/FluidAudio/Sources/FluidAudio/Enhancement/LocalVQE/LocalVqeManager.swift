@@ -44,8 +44,10 @@ public actor LocalVqeManager {
     public var isAvailable: Bool { model != nil }
 
     /// Download (if needed) and load the configured model from HuggingFace.
+    /// Transcript Maker: `directory` (optional) is where models are kept instead of FluidAudio's own folder.
     public init(
         config: LocalVqeConfig = .default,
+        directory: URL? = nil,
         progressHandler: ProgressHandler? = nil
     ) async throws {
         self.config = config
@@ -54,7 +56,7 @@ public actor LocalVqeManager {
         let models = try await ModelHub.loadModels(
             .localVqe,
             modelNames: [fileName],
-            directory: Self.defaultBaseDirectory().appendingPathComponent("Models"),
+            directory: directory ?? Self.defaultBaseDirectory().appendingPathComponent("Models"),
             computeUnits: config.computeUnits,
             variant: ModelNames.LocalVQE.variantKey(variant: config.variant, chunk: config.chunk),
             progressHandler: progressHandler

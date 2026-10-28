@@ -228,6 +228,22 @@ struct ItemDetail: View {
                         .font(.caption).foregroundColor(.secondary)
                 }
             }
+            if let transcript = item.transcript {
+                Section("Transcript") {
+                    ScrollView {
+                        TranscriptPreview(transcript: transcript)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(height: 300)
+                }
+            }
+            Section("Sound") {
+                Picker("Clean up the sound", selection: $item.cleanup) {
+                    ForEach(Cleanup.allCases, id: \.self) { Text($0.label).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                Text(cleanupNote).font(.caption).foregroundColor(.secondary)
+            }
             Section("Save as") {
                 ForEach(ExportFormat.allCases, id: \.self) { format in
                     Toggle(format.label, isOn: Binding(
@@ -240,14 +256,17 @@ struct ItemDetail: View {
                     Button("Save again with these settings") { model.exportAll(item) }
                 }
             }
-            if let transcript = item.transcript {
-                Section("Transcript") {
-                    TranscriptPreview(transcript: transcript)
-                }
-            }
         }
         .formStyle(.grouped)
         .onChange(of: item.id) { names = [:] }
+    }
+
+    private var cleanupNote: String {
+        switch item.cleanup {
+        case .off: return "Best for almost every recording: the speech model copes with noise on its own. In tests with noise, music and echo, Off made the fewest mistakes."
+        case .gentle: return "Takes out rumble and hum and evens out loud and quiet voices. Can help a little when someone is far from the microphone; slightly worse with music."
+        case .strong: return "Also removes background noise and room echo. In tests it made about twice as many mistakes as Off, so keep it for recordings that are hard to follow by ear."
+        }
     }
 
     private var info: String {
@@ -357,6 +376,9 @@ struct SettingsView: View {
             }
             Section("Queue") {
                 Toggle("Start transcribing as soon as files are added", isOn: $model.startWhenAdded)
+                Picker("Clean up the sound for new files", selection: $model.defaultCleanup) {
+                    ForEach(Cleanup.allCases, id: \.self) { Text($0.label).tag($0) }
+                }
             }
             Section("Privacy") {
                 Text("Everything happens on this Mac. Videos, audio and transcripts are never uploaded.")
@@ -364,6 +386,6 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 480, height: 300)
+        .frame(width: 480, height: 340)
     }
 }

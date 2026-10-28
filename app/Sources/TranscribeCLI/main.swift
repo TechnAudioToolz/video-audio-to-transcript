@@ -1,15 +1,26 @@
 import Foundation
 import TranscriptCore
 
-// transcribe-cli VIDEO [--speakers N] [--out FOLDER] [--json FILE] [--progress]
+// transcribe-cli VIDEO [--speakers N] [--cleanup off|gentle|strong] [--out FOLDER] [--json FILE] [--progress]
 //   Writes VIDEO's transcript as JSON, PDF, DOCX, TXT, SRT and VTT into FOLDER (default: next to the video).
 //   --json FILE   write only the transcript JSON, to FILE (the app does this, then writes the other files itself)
 //   --progress    also print machine-readable lines for the app: "@stage listening 0.42"
+// transcribe-cli --download-models   fetch every model into the models folder (for the offline edition)
 // The app runs this as a separate process, so Pause can freeze it and Stop can end it at once.
 setvbuf(stdout, nil, _IOLBF, 0)  // line by line, so the app sees progress as it happens
 
 let args = Array(CommandLine.arguments.dropFirst())
-let flagsWithValues = ["--speakers", "--out", "--json"]
+if args.contains("--download-models") {  // for make_offline_dmg.sh
+    do {
+        try await Pipeline().downloadAll(log: { print($0) })
+        print("Models ready in \(ModelStore.folder.path)")
+        exit(0)
+    } catch {
+        print("Failed: \(error.localizedDescription)")
+        exit(1)
+    }
+}
+let flagsWithValues = ["--speakers", "--out", "--json", "--cleanup"]
 func value(_ flag: String) -> String? {
     args.firstIndex(of: flag).flatMap { args.indices.contains($0 + 1) ? args[$0 + 1] : nil }
 }
@@ -17,11 +28,12 @@ let positional = args.enumerated().filter { i, arg in
     !arg.hasPrefix("--") && !(i > 0 && flagsWithValues.contains(args[i - 1]))
 }.map(\.element)
 guard let path = positional.first else {
-    print("usage: transcribe-cli VIDEO [--speakers N] [--out FOLDER] [--json FILE] [--progress]")
+    print("usage: transcribe-cli VIDEO [--speakers N] [--cleanup off|gentle|strong] [--out FOLDER] [--json FILE] [--progress]")
     exit(2)
 }
 let input = URL(fileURLWithPath: path)
-let options = PipelineOptions(speakers: value("--speakers").flatMap(Int.init))
+let options = PipelineOptions(speakers: value("--speakers").flatMap(Int.init),
+                              cleanup: value("--cleanup").flatMap(Cleanup.init(rawValue:)) ?? .off)
 let machine = args.contains("--progress")
 
 final class StageMeter: @unchecked Sendable {

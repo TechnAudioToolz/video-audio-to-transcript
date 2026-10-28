@@ -46,19 +46,43 @@ struct TranscriptMakerApp: App {
         if let i = args.firstIndex(of: "--snapshot"), args.indices.contains(i + 1) {
             startSnapshots(to: URL(fileURLWithPath: args[i + 1]))
         }
+        if let i = args.firstIndex(of: "--screenshots"), args.indices.contains(i + 1) {
+            screenshotsWhenDone(into: URL(fileURLWithPath: args[i + 1]))
+        }
+    }
+
+    /// For README pictures: once the queue is finished, shows each item in turn and saves the window as
+    /// "<title>.png" in `folder`.
+    func screenshotsWhenDone(into folder: URL) {
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { timer in
+            Task { @MainActor in
+                guard !model.isRunning, !model.items.isEmpty, model.items.allSatisfy({ $0.state == .done || $0.state == .failed }) else { return }
+                timer.invalidate()
+                NSApp.windows.first { $0.toolbar != nil }?.setContentSize(NSSize(width: 1280, height: 800))
+                for item in model.items {
+                    model.selection = item.id
+                    try? await Task.sleep(for: .seconds(2))
+                    saveWindow(to: folder.appendingPathComponent(item.title + ".png"))
+                }
+            }
+        }
     }
 
     /// For testing and README images: saves a picture of the window to `file` every 3 seconds.
     func startSnapshots(to file: URL) {
         Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in
-            DispatchQueue.main.async {
-                guard let frame = NSApp.windows.first(where: { $0.isVisible && $0.toolbar != nil })?.contentView?.superview,
-                      let rep = frame.bitmapImageRepForCachingDisplay(in: frame.bounds) else { return }
-                frame.cacheDisplay(in: frame.bounds, to: rep)
-                try? rep.representation(using: .png, properties: [:])?.write(to: file)
-            }
+            DispatchQueue.main.async { saveWindow(to: file) }
         }
     }
+}
+
+@MainActor
+func saveWindow(to file: URL) {
+    guard let frame = NSApp.windows.first(where: { $0.isVisible && $0.toolbar != nil })?.contentView?.superview,
+          let rep = frame.bitmapImageRepForCachingDisplay(in: frame.bounds) else { return }
+    frame.cacheDisplay(in: frame.bounds, to: rep)
+    try? rep.representation(using: .png, properties: [:])?.write(to: file)
 }
 
 let projectURL = URL(string: "https://github.com/TechnAudioToolz/video-audio-to-transcript")!
@@ -204,7 +228,9 @@ struct ContentView: View {
         HStack {
             Text(model.lastMessage)
             Spacer()
-            Text("Output: \(model.outputFolder.path)").lineLimit(1).truncationMode(.head)
+            // in demo runs (README pictures) the usual folder is shown, not the temporary one
+            Text("Output: \(AppModel.demoFolder == nil ? (model.outputFolder.path as NSString).abbreviatingWithTildeInPath : "~/Transcripts")")
+                .lineLimit(1).truncationMode(.head)
         }
         .font(.caption)
         .foregroundColor(.secondary)
